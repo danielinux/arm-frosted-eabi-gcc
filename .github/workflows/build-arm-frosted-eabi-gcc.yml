@@ -1,0 +1,35 @@
+name: Build arm-frosted-eabi toolchain from sources
+
+on:
+  push:
+    branches: [ 'master', 'release/**' ]
+  pull_request:
+    branches: [ '*' ]
+
+jobs:
+  build-toolchain:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Install requirements
+        run: sudo apt-get install --no-install-recommends -y -q build-essential automake autoconf autoconf2.69 gettext texinfo libtool-bin help2man 
+
+      - name: Compile toolchain
+        run: |
+          ./build.sh
+
+      - name: Create toolchain tarball
+        run: |
+          tar -c "$HOME/x-tools" -czf "arm-frosted-eabi-latest.tgz" "arm-frosted-eabi"
+
+      - name: Upload Toolchain
+        uses: actions/upload-artifact@v4
+        with:
+          name: arm-frosted-eabi GNU Gcc toolchain
+          path: |
+            arm-frosted-eabi-latest.tgz
+

@@ -221,7 +221,7 @@ CT_ARCH_FPU=""
 # CT_ARCH_FLOAT_HW is not set
 # CT_ARCH_FLOAT_SOFTFP is not set
 CT_ARCH_FLOAT_SW=y
-CT_TARGET_CFLAGS="-fPIC -mlong-calls -fno-common -msingle-pic-base -mno-pic-data-is-text-relative"
+CT_TARGET_CFLAGS="-fPIC -mlong-calls -fno-common -msingle-pic-base -mno-pic-data-is-text-relative -D__FROSTED__ -DSIGNAL_PROVIDED"
 CT_TARGET_LDFLAGS=""
 CT_ARCH_FLOAT="soft"
 # end of Target options

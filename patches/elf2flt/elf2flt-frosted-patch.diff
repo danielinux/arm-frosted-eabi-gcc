@@ -1,3 +1,388 @@
+diff --git a/elf2flt.c b/elf2flt.c
+index d5e32ab..fea1ce2 100644
+--- a/elf2flt.c
++++ b/elf2flt.c
+@@ -188,6 +188,98 @@ static int use_resolved = 0;
+    set the load_to_ram flag.  */
+ static int text_has_relocs = 0;
+ 
++/* Shared library mode: produce a library bFLT with export table. */
++static int shared_lib = 0;
++static int lib_id = 0;
++static char *exports_file = NULL;
++
++/* Import map: tag GOT entries for shared library imports. */
++#define MAX_IMPORT_MAPS 8
++static char *import_maps[MAX_IMPORT_MAPS];
++static int n_import_maps = 0;
++
++/* Parsed import map entries */
++struct import_entry {
++    char *symbol;
++    uint8_t lib_id;
++    uint32_t ordinal;
++};
++static struct import_entry *imports = NULL;
++static int n_imports = 0;
++
++/* Parsed export list */
++static char **export_symbols = NULL;
++static int n_exports = 0;
++
++static void load_exports(const char *filename)
++{
++    FILE *f = fopen(filename, "r");
++    char line[256];
++    if (!f)
++        fatal_perror("Can't open exports file '%s'", filename);
++    while (fgets(line, sizeof(line), f)) {
++        char *p = line;
++        while (*p && (*p == ' ' || *p == '\t')) p++;
++        /* skip empty lines and comments */
++        if (*p == '\0' || *p == '\n' || *p == '#')
++            continue;
++        /* trim newline */
++        char *nl = strchr(p, '\n');
++        if (nl) *nl = '\0';
++        export_symbols = realloc(export_symbols, (n_exports + 1) * sizeof(char *));
++        export_symbols[n_exports++] = strdup(p);
++    }
++    fclose(f);
++}
++
++static void load_import_map(const char *filename)
++{
++    FILE *f = fopen(filename, "r");
++    char line[256];
++    uint8_t map_lib_id = 0;
++    if (!f)
++        fatal_perror("Can't open import map '%s'", filename);
++    while (fgets(line, sizeof(line), f)) {
++        char *p = line;
++        while (*p && (*p == ' ' || *p == '\t')) p++;
++        if (*p == '\0' || *p == '\n' || *p == '#')
++            continue;
++        char *nl = strchr(p, '\n');
++        if (nl) *nl = '\0';
++        /* LIB_ID=N header */
++        if (strncmp(p, "LIB_ID=", 7) == 0) {
++            map_lib_id = atoi(p + 7);
++            if (map_lib_id == 0)
++                fatal("Invalid LIB_ID in import map '%s'", filename);
++            continue;
++        }
++        /* symbol=ordinal */
++        char *eq = strchr(p, '=');
++        if (!eq)
++            fatal("Bad line in import map '%s': %s", filename, p);
++        *eq = '\0';
++        if (map_lib_id == 0)
++            fatal("Import map '%s' missing LIB_ID header", filename);
++        imports = realloc(imports, (n_imports + 1) * sizeof(struct import_entry));
++        imports[n_imports].symbol = strdup(p);
++        imports[n_imports].lib_id = map_lib_id;
++        imports[n_imports].ordinal = atoi(eq + 1);
++        n_imports++;
++    }
++    fclose(f);
++}
++
++/* Find an import entry for a symbol name.  Returns NULL if not found. */
++static struct import_entry *find_import(const char *name)
++{
++    int i;
++    for (i = 0; i < n_imports; i++) {
++        if (strcmp(imports[i].symbol, name) == 0)
++            return &imports[i];
++    }
++    return NULL;
++}
++
+ static asymbol **
+ get_symbols (bfd *abfd, long *num)
+ {
+@@ -686,6 +778,15 @@ output_relocs (
+ 				case R_ARM_PREL31:
+ 				case R_ARM_V4BX:
+ 				case R_ARM_NONE:
++				/* MOVW/MOVT absolute relocations are resolved at link
++				 * time when the output is linked at a fixed address (as
++				 * is the case for XIP shared libraries). The instruction
++				 * bytes already contain the correct absolute address, so
++				 * no runtime fixup is required. */
++				case R_ARM_MOVW_ABS_NC:
++				case R_ARM_MOVT_ABS:
++				case R_ARM_THM_MOVW_ABS_NC:
++				case R_ARM_THM_MOVT_ABS:
+ 					relocation_needed = 0;
+ 					break;
+ 				default:
+@@ -944,13 +1045,20 @@ output_relocs (
+ 							"address=0x%"PRIx64" "
+ 							"sym_addr=0x%x rs=0x%x, opcode=0x%x\n",
+ 							"ABS32",
+-							sym_vma, 
++							sym_vma,
+ 							(uint64_t) (*(q->sym_ptr_ptr))->value,
+ 							(uint64_t) q->address, sym_addr,
+ 							(*p)->howto->rightshift,
+ 							*(uint32_t *)r_mem);
+ 					sym_vma = elf2flt_bfd_section_vma(sym_section);
+ 					sym_addr += sym_vma + q->addend;
++					/* For shared libs linked at a fixed flash address,
++					 * normalise values stored in .data to be offsets
++					 * from the library's link-time base (text_vma) so
++					 * the Frosted loader's file-relative offset scheme
++					 * works unchanged. */
++					if (shared_lib)
++						sym_addr -= text_vma;
+ 					break;
+ 				case R_ARM_GOT32:
+ 				case R_ARM_GOTPC:
+@@ -1648,8 +1756,11 @@ DIS29_RELOCATION:
+ 				flat_relocs = realloc(flat_relocs,
+ 					(flat_reloc_count + 1) * sizeof(uint32_t));
+ #ifndef TARGET_e1
++				/* For shared libs: emit file-relative offsets
++				 * (Frosted loader's offset scheme) instead of
++				 * link-time VMAs. */
+ 				flat_relocs[flat_reloc_count] = pflags |
+-					(section_vma + q->address);
++					(section_vma + q->address - (shared_lib ? text_vma : 0));
+ 
+ #else
+ 				switch ((*p)->howto->type) {
+@@ -1719,7 +1830,11 @@ static void usage(int status)
+ 		"       -R reloc-file   : read relocations from a separate file\n"
+ 		"       -p abs-pic-file : GOT/PIC processing with files\n"
+ 		"       -s stacksize    : set application stack size\n"
+-		"       -o output-file  : output file name\n\n"
++		"       -o output-file  : output file name\n"
++		"       -S              : produce shared library bFLT\n"
++		"       -L lib-id       : library ID (1-255, requires -S)\n"
++		"       -E exports-file : exported symbols file (requires -S)\n"
++		"       -I import-map   : import map file (can be repeated)\n\n"
+ 		"Compiled for " ARCH " architecture\n\n",
+ 		elf2flt_progname);
+ 	exit(status);
+@@ -1819,7 +1934,7 @@ int main(int argc, char *argv[])
+   stack = 0x2020;
+ #endif
+ 
+-  while ((opt = getopt(argc, argv, "havzdrkp:s:o:R:")) != -1) {
++  while ((opt = getopt(argc, argv, "havzdrkp:s:o:R:SL:E:I:")) != -1) {
+     switch (opt) {
+     case 'v':
+       verbose++;
+@@ -1854,6 +1969,24 @@ int main(int argc, char *argv[])
+     case 'R':
+       rel_file = optarg;
+       break;
++    case 'S':
++      shared_lib = 1;
++      break;
++    case 'L':
++      lib_id = atoi(optarg);
++      if (lib_id < 1 || lib_id > 255) {
++        fprintf(stderr, "%s: lib-id must be 1-255\n", argv[0]);
++        usage(1);
++      }
++      break;
++    case 'E':
++      exports_file = optarg;
++      break;
++    case 'I':
++      if (n_import_maps >= MAX_IMPORT_MAPS)
++        fatal("Too many import maps (max %d)", MAX_IMPORT_MAPS);
++      import_maps[n_import_maps++] = optarg;
++      break;
+     case 'h':
+       usage(0);
+       break;
+@@ -1864,6 +1997,21 @@ int main(int argc, char *argv[])
+     }
+   }
+ 
++  /* Validate shared library options */
++  if (shared_lib) {
++    if (!lib_id)
++      fatal("-S (shared library) requires -L lib-id");
++    if (!exports_file)
++      fatal("-S (shared library) requires -E exports-file");
++    load_exports(exports_file);
++    if (n_exports == 0)
++      fatal("Exports file '%s' contains no symbols", exports_file);
++  }
++
++  /* Load import maps */
++  for (i = 0; i < n_import_maps; i++)
++    load_import_map(import_maps[i]);
++
+   /*
+    * if neither the -r or -p options was given,  default to
+    * a RAM load as that is the only option that makes sense.
+@@ -2010,12 +2158,103 @@ int main(int argc, char *argv[])
+   if (reloc == NULL && verbose)
+     printf("No relocations in code!\n");
+ 
++  /*
++   * Import map processing: scan the GOT (at the start of .data) and
++   * replace entries whose symbols match import map entries with
++   * (lib_id << 24) | ordinal.  This tells the kernel's bFLT loader
++   * to resolve these via the shared library's export table.
++   */
++  if (n_imports > 0 && pic_with_got) {
++    uint32_t *got = (uint32_t *)data;
++    uint32_t got_words = 0;
++    int tagged = 0;
++
++    /* Find GOT size (terminated by 0xffffffff) */
++    while (got[got_words] != 0xffffffff)
++      got_words++;
++
++    for (i = 0; i < (int)got_words; i++) {
++      uint32_t addr = got[i];
++      long si;
++      if (addr == 0)
++        continue;
++      /* Find which symbol this GOT entry refers to by matching
++         the resolved address against symbol table entries */
++      for (si = 0; si < number_of_symbols; si++) {
++        asymbol *sym = symbol_table[si];
++        uint32_t sym_val;
++        struct import_entry *imp;
++        if (!sym->section || !(sym->section->flags & (SEC_CODE | SEC_DATA)))
++          continue;
++        sym_val = sym->value + elf2flt_bfd_section_vma(sym->section);
++        /* Mask Thumb bit — GOT entries have bit 0 set for Thumb targets */
++        if ((sym_val & ~1u) != (addr & ~1u))
++          continue;
++        imp = find_import(sym->name);
++        if (imp) {
++          got[i] = ((uint32_t)imp->lib_id << 24) | (imp->ordinal & 0x00FFFFFFu);
++          if (verbose)
++            printf("IMPORT: GOT[%d] %s -> lib=%d ord=%d\n",
++                   i, sym->name, imp->lib_id, imp->ordinal);
++          tagged++;
++          break;
++        }
++      }
++    }
++    if (verbose)
++      printf("Tagged %d GOT entries as shared library imports\n", tagged);
++  }
++
++  /*
++   * Shared library export table: build the table that maps ordinals
++   * to .text-relative offsets.  Written after relocs in the output file.
++   */
++  uint32_t *export_table = NULL;
++  uint32_t export_table_size = 0;  /* in bytes */
++
++  if (shared_lib) {
++    /* export table: version(4) + count(4) + offsets[n_exports](4 each) */
++    export_table_size = (2 + n_exports) * sizeof(uint32_t);
++    export_table = xmalloc(export_table_size);
++
++    export_table[0] = htonl(1);          /* version */
++    export_table[1] = htonl(n_exports);  /* count */
++
++    for (i = 0; i < n_exports; i++) {
++      long si;
++      int found = 0;
++      for (si = 0; si < number_of_symbols; si++) {
++        asymbol *sym = symbol_table[si];
++        if (strcmp(sym->name, export_symbols[i]) == 0 &&
++            sym->section && (sym->section->flags & SEC_CODE)) {
++          uint32_t offset = sym->value + elf2flt_bfd_section_vma(sym->section) - text_vma;
++          export_table[2 + i] = htonl(offset);
++          if (verbose)
++            printf("EXPORT[%d]: %s -> .text+0x%x\n", i, export_symbols[i], offset);
++          found = 1;
++          break;
++        }
++      }
++      if (!found)
++        fatal("Exported symbol '%s' not found in .text", export_symbols[i]);
++    }
++  }
++
+   text_offs = real_address_bits(text_vma);
+ 
++  /* For shared libraries linked at a fixed flash address (XIP): the bFLT file
++   * is meant to be placed at that address by the packing tool, so the output
++   * must be compact (no VMA-derived leading padding) and header offsets must
++   * be file-relative, not absolute. The text VMA is still used at link time
++   * to resolve MOVW/MOVT absolute references within .text. */
++  if (shared_lib)
++    text_offs = 0;
++
+   /* Fill in the binflt_flat header */
+   memcpy(hdr.magic,"bFLT",4);
+   hdr.rev         = htonl(FLAT_VERSION);
+-  hdr.entry       = htonl(sizeof(hdr) + bfd_get_start_address(abs_bfd));
++  /* For shared libs, entry point is unused (library has no _start). Leave 0. */
++  hdr.entry       = htonl(shared_lib ? 0 : (sizeof(hdr) + bfd_get_start_address(abs_bfd)));
+   hdr.data_start  = htonl(sizeof(hdr) + text_offs + text_len);
+   hdr.data_end    = htonl(sizeof(hdr) + text_offs + text_len +data_len);
+   hdr.bss_end     = htonl(sizeof(hdr) + text_offs + text_len +data_len+bss_len);
+@@ -2027,10 +2266,20 @@ int main(int argc, char *argv[])
+ 	  | (ktrace ? FLAT_FLAG_KTRACE : 0)
+ 	  | (pic_with_got ? FLAT_FLAG_GOTPIC : 0)
+ 	  | (docompress ? (docompress == 2 ? FLAT_FLAG_GZDATA : FLAT_FLAG_GZIP) : 0)
++	  | (shared_lib ? FLAT_FLAG_SHLIB : 0)
+ 	  );
+   hdr.build_date = htonl((uint32_t)get_build_date());
+   memset(hdr.filler, 0x00, sizeof(hdr.filler));
+ 
++  /* Shared library: fill in filler[] with export table metadata */
++  if (shared_lib) {
++    uint32_t export_off = sizeof(hdr) + text_offs + text_len + data_len
++                          + reloc_len * sizeof(uint32_t);
++    hdr.filler[FLAT_SHLIB_EXPORT_OFF] = htonl(export_off);
++    hdr.filler[FLAT_SHLIB_EXPORT_CNT] = htonl(n_exports);
++    hdr.filler[FLAT_SHLIB_LIB_ID]     = htonl(lib_id);
++  }
++
+   for (i=0; i<reloc_len; i++) reloc[i] = htonl(reloc[i]);
+ 
+   if (verbose) {
+@@ -2077,8 +2326,35 @@ int main(int argc, char *argv[])
+   if (reloc)
+     fwrite_stream(reloc, reloc_len * 4, 1, &gf);
+ 
++  /* Write export table for shared libraries */
++  if (shared_lib && export_table)
++    fwrite_stream(export_table, export_table_size, 1, &gf);
++
+   fclose_stream(&gf);
+ 
++  /* Generate .map file for shared libraries (consumed by --import-map) */
++  if (shared_lib) {
++    char *mapfile = xmalloc(strlen(ofile) + 5);
++    FILE *mf;
++    strcpy(mapfile, ofile);
++    /* Replace extension with .map */
++    char *dot = strrchr(mapfile, '.');
++    if (dot && (strcmp(dot, ".bflt") == 0 || strcmp(dot, ".so") == 0))
++      strcpy(dot, ".map");
++    else
++      strcat(mapfile, ".map");
++    mf = fopen(mapfile, "w");
++    if (!mf)
++      fatal_perror("Can't create map file '%s'", mapfile);
++    fprintf(mf, "LIB_ID=%d\n", lib_id);
++    for (i = 0; i < n_exports; i++)
++      fprintf(mf, "%s=%d\n", export_symbols[i], i);
++    fclose(mf);
++    if (verbose)
++      printf("Wrote import map: %s\n", mapfile);
++    free(mapfile);
++  }
++
+   exit(0);
+ }
+ 
 diff --git a/elf2flt.ld.in b/elf2flt.ld.in
 index 230c382..47cf47e 100644
 --- a/elf2flt.ld.in
@@ -40,3 +425,20 @@ index 230c382..47cf47e 100644
  
  	.data ALIGN(0x20): {
  		@SYMBOL_PREFIX@_sdata = . ;
+diff --git a/flat.h b/flat.h
+index 77547d8..2ca2659 100644
+--- a/flat.h
++++ b/flat.h
+@@ -61,6 +61,12 @@ struct flat_hdr {
+ #define FLAT_FLAG_GZDATA 0x0008 /* only data/relocs are compressed (for XIP) */
+ #define FLAT_FLAG_KTRACE 0x0010 /* output useful kernel trace for debugging */
+ #define FLAT_FLAG_L1STK  0x0020 /* use a 4k stack in L1 scratch memory.  */
++#define FLAT_FLAG_SHLIB  0x0040 /* shared library with export table */
++
++/* Shared library filler[] indices */
++#define FLAT_SHLIB_EXPORT_OFF  0  /* export table offset from file start */
++#define FLAT_SHLIB_EXPORT_CNT  1  /* number of exports */
++#define FLAT_SHLIB_LIB_ID      2  /* library ID (1-255) */
+ 
+ #ifdef __KERNEL__ /* so systems without linux headers can compile the apps */
+ /*

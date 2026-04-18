@@ -3,8 +3,12 @@ name: Build arm-frosted-eabi toolchain from sources
 on:
   push:
     branches: [ 'master', 'release/**' ]
+    tags: [ 'v*' ]
   pull_request:
     branches: [ '*' ]
+
+permissions:
+  contents: write
 
 jobs:
   build-toolchain:
@@ -16,20 +20,41 @@ jobs:
           submodules: true
 
       - name: Install requirements
-        run: sudo apt-get install --no-install-recommends -y -q build-essential automake autoconf autoconf2.69 gettext texinfo libtool-bin help2man 
+        run: sudo apt-get install --no-install-recommends -y -q build-essential automake autoconf autoconf2.69 gettext texinfo libtool-bin help2man
 
       - name: Compile toolchain
         run: |
           ./build.sh
 
+      - name: Determine tarball name
+        id: tarball
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            version="${GITHUB_REF_NAME}"
+          else
+            version="latest"
+          fi
+          name="arm-frosted-eabi-${version}.tgz"
+          echo "name=${name}" >> "$GITHUB_OUTPUT"
+          echo "path=${HOME}/x-tools/${name}" >> "$GITHUB_OUTPUT"
+
       - name: Create toolchain tarball
         run: |
-          cd "$HOME/x-tools" && tar czvf "arm-frosted-eabi-latest.tgz" "arm-frosted-eabi" && cd -
+          cd "$HOME/x-tools" && tar czvf "${{ steps.tarball.outputs.name }}" "arm-frosted-eabi"
 
-      - name: Upload Toolchain
+      - name: Upload Toolchain (CI artifact)
         uses: actions/upload-artifact@v4
         with:
-          name: arm-frosted-eabi GNU Gcc toolchain
-          path: |
-            $HOME/x-tools/
+          name: arm-frosted-eabi-gcc-toolchain
+          path: ${{ steps.tarball.outputs.path }}
+
+      - name: Publish release tarball
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.tarball.outputs.path }}
+          tag_name: ${{ github.ref_name }}
+          name: arm-frosted-eabi-gcc ${{ github.ref_name }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
 
